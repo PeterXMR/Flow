@@ -57,6 +57,9 @@ class FlowApplication : Application(), ImageLoaderFactory {
         private const val VISITOR_DATA_KEY = "visitor_data"
         private const val VISITOR_DATA_FETCHED_AT_KEY = "visitor_data_fetched_at"
         private const val VISITOR_DATA_MAX_AGE_MS = 7L * 24L * 60L * 60L * 1_000L
+        // Stable, long-lived public video used only to force YouTube's base.js player script to
+        // download at startup ("Me at the zoo", the first video on YouTube). Never played.
+        private const val BASE_JS_WARMUP_VIDEO_ID = "jNQXAC9IVRw"
         lateinit var appContext: Context
             private set
     }
@@ -168,6 +171,22 @@ class FlowApplication : Application(), ImageLoaderFactory {
                 io.github.aedev.flow.utils.potoken.WebPoTokenSession.prewarm()
             } catch (e: Exception) {
                 Log.w(TAG, "WebPoTokenSession prewarm failed: ${e.message}")
+            }
+        }
+
+        // Warm YouTube's base.js player script at startup so the first video open doesn't pay a
+        // serial ~1.5-2MB download on the critical path. getSignatureTimestamp() forces the NewPipe
+        // (Rhino) player-code fetch, and that in-memory player code is the SAME one the common
+        // fast-path n-parameter deobfuscation (deobfuscateThrottling) reuses — so the first real
+        // extraction hits a warm cache. Best-effort and fail-open: if it fails, first play simply
+        // pays the cost as before. Runs in parallel with the PoToken prewarm above.
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            try {
+                NewPipeExtractor.getSignatureTimestamp(BASE_JS_WARMUP_VIDEO_ID)
+                    .onSuccess { Log.d(TAG, "base.js warmed at startup (sts=$it)") }
+                    .onFailure { Log.w(TAG, "base.js warmup failed: ${it.message}") }
+            } catch (e: Exception) {
+                Log.w(TAG, "base.js warmup error: ${e.message}")
             }
         }
 

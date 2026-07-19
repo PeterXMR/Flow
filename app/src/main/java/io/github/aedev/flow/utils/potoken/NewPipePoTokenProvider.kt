@@ -1,32 +1,46 @@
 package io.github.aedev.flow.utils.potoken
 
 import android.util.Log
-import org.schabi.newpipe.extractor.NewPipe
-import org.schabi.newpipe.extractor.services.youtube.InnertubeClientRequestInfo
+import kotlinx.coroutines.runBlocking
 import org.schabi.newpipe.extractor.services.youtube.PoTokenProvider
 import org.schabi.newpipe.extractor.services.youtube.PoTokenResult as ExtractorPoTokenResult
-import org.schabi.newpipe.extractor.services.youtube.YoutubeParsingHelper
 
+/**
+ * PoToken provider for the NewPipe extractor path.
+ *
+ * Delegates to the shared [WebPoTokenSession] singleton so the WEB BotGuard attestation is
+ * minted **once per app session** and reused by every extractor branch.
+ *
+ * Previously this object kept its own [PoTokenGenerator] and fetched its own visitorData, so the
+ * NewPipe branch spun up a second, cold BotGuard WebView on the first video open — duplicating the
+ * native InnerTube branch's work and bypassing FlowApplication's startup prewarm. Because a video
+ * open races the NewPipe and InnerTube resolvers, that meant two independent cold attestations on a
+ * deep-link cold start. Sharing the session collapses them into one warm attestation, so the first
+ * link-open no longer pays for a redundant BotGuard run.
+ *
+ * The [ExtractorPoTokenResult] carries the same [visitorData] the token was minted against, so the
+ * NewPipe extractor uses a matching visitorData/poToken pair for its WEB client player request.
+ */
 object NewPipePoTokenProvider : PoTokenProvider {
     private const val TAG = "NewPipePoTokenProvider"
 
-    private val poTokenGenerator = PoTokenGenerator()
-    private val visitorDataLock = Any()
-    private var webPoTokenVisitorData: String? = null
+    override fun getWebClientPoToken(videoId: String): ExtractorPoTokenResult? = runBlocking {
+        val visitorData = WebPoTokenSession.sessionVisitorData()
+        if (visitorData.isNullOrBlank()) {
+            Log.w(TAG, "No session visitorData available for $videoId")
+            return@runBlocking null
+        }
 
-    override fun getWebClientPoToken(videoId: String): ExtractorPoTokenResult? {
-        val visitorData = ensureVisitorData() ?: return null
-        val poTokenResult = try {
-            poTokenGenerator.getWebClientPoToken(videoId, visitorData)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to generate extractor poToken for $videoId: ${e.message}", e)
-            null
-        } ?: return null
+        val result = WebPoTokenSession.mintForVisitorData(videoId, visitorData)
+        if (result == null) {
+            Log.w(TAG, "Shared PoToken session returned no token for $videoId")
+            return@runBlocking null
+        }
 
-        return ExtractorPoTokenResult(
+        ExtractorPoTokenResult(
             visitorData,
-            poTokenResult.playerRequestPoToken,
-            poTokenResult.streamingDataPoToken
+            result.playerRequestPoToken,
+            result.streamingDataPoToken,
         )
     }
 
@@ -35,28 +49,4 @@ object NewPipePoTokenProvider : PoTokenProvider {
     override fun getAndroidClientPoToken(videoId: String): ExtractorPoTokenResult? = null
 
     override fun getIosClientPoToken(videoId: String): ExtractorPoTokenResult? = null
-
-    private fun ensureVisitorData(): String? {
-        synchronized(visitorDataLock) {
-            webPoTokenVisitorData?.takeIf { it.isNotBlank() }?.let { return it }
-
-            return runCatching {
-                val requestInfo = InnertubeClientRequestInfo.ofWebClient()
-                requestInfo.clientInfo.clientVersion = YoutubeParsingHelper.getClientVersion()
-                YoutubeParsingHelper.getVisitorDataFromInnertube(
-                    requestInfo,
-                    NewPipe.getPreferredLocalization(),
-                    NewPipe.getPreferredContentCountry(),
-                    YoutubeParsingHelper.getYouTubeHeaders(),
-                    YoutubeParsingHelper.YOUTUBEI_V1_URL,
-                    null,
-                    false
-                )
-            }.onFailure { e ->
-                Log.w(TAG, "Failed to fetch extractor visitor data: ${e.message}", e)
-            }.getOrNull()
-                ?.takeIf { it.isNotBlank() }
-                ?.also { webPoTokenVisitorData = it }
-        }
-    }
 }

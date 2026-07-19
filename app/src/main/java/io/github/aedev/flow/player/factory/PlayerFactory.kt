@@ -2,6 +2,7 @@ package io.github.aedev.flow.player.factory
 
 import android.app.ActivityManager
 import android.content.Context
+import android.net.ConnectivityManager
 import android.util.Log
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -17,6 +18,7 @@ import androidx.media3.exoplayer.trackselection.AdaptiveTrackSelection
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.exoplayer.upstream.DefaultAllocator
 import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
+import io.github.aedev.flow.data.local.BufferProfile
 import io.github.aedev.flow.data.local.PlayerPreferences
 import io.github.aedev.flow.player.audio.shouldHandleAudioFocus
 import io.github.aedev.flow.player.config.PlayerConfig
@@ -133,7 +135,22 @@ class PlayerFactory {
         val prefs = ensurePrefs(context)
         val minBufferMs = prefs.minBufferMs.coerceIn(2_500, maxSafeMinBufferMs)
         val maxBufferMs = prefs.maxBufferMs.coerceIn(minBufferMs + 5_000, maxSafeBufferMs)
-        val bufferForPlaybackMs = prefs.bufferForPlaybackMs.coerceIn(250, minBufferMs)
+
+        // Fast start: how much media to prebuffer before playback BEGINS (time-to-first-frame gate).
+        // The old STABLE default (2500ms) was a big, avoidable startup delay. Prebuffer only a small
+        // slice instead, network-aware so slow/metered links keep a slightly larger cushion. Only
+        // applied when the stored value is at/above the STABLE default (i.e. the user hasn't
+        // deliberately chosen a smaller start buffer). bufferForPlaybackAfterRebufferMs still cushions
+        // any mid-playback rebuffer. Note: read once at player build; re-evaluated on player recreation.
+        val isMeteredNetwork = (context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
+            ?.isActiveNetworkMetered ?: false
+        val fastStartPlaybackMs = if (isMeteredNetwork) 1_000 else 500
+        val requestedPlaybackMs = if (prefs.bufferForPlaybackMs >= BufferProfile.STABLE.playbackBuffer) {
+            fastStartPlaybackMs
+        } else {
+            prefs.bufferForPlaybackMs
+        }
+        val bufferForPlaybackMs = requestedPlaybackMs.coerceIn(250, minBufferMs)
         val bufferRebufferMs = prefs.bufferRebufferMs.coerceIn(750, maxBufferMs)
 
         Log.d(TAG, "Buffer config: min=${minBufferMs}ms, max=${maxBufferMs}ms, playback=${bufferForPlaybackMs}ms, rebuffer=${bufferRebufferMs}ms, target=${targetBufferBytes / 1024 / 1024}MB, back=${backBufferMs}ms, heap=${memoryClassMb}MB")
